@@ -1,0 +1,293 @@
+<html>
+<head>
+<style>
+    body {
+        font-family: sans-serif;
+        text-align: center;
+        padding-top: 20px;
+        /* Optional: Add some padding to the bottom to give more space */
+        padding-bottom: 50px; 
+    }
+    #note-info-container {
+        /* Container for note name and frequency to fix height */
+        min-height: 100px; /* Adjust as needed */
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        margin-bottom: 20px;
+    }
+    #note-name {
+        min-height: 1.5em; /* Enough space for one line of text */
+        margin-bottom: 5px; /* Space between note name and frequency */
+    }
+    #frequency-display-container {
+        min-height: 1.2em; /* Enough space for frequency text */
+    }
+    #tuning-status {
+        width: 150px;
+        height: 50px;
+        margin: 20px auto;
+        border: 2px solid #ccc;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: bold;
+        color: white;
+        font-size: 1.2em;
+        transition: background-color 0.3s ease;
+    }
+    #tuning-status.in-tune {
+        background-color: #4CAF50; /* Green */
+    }
+    #tuning-status.out-of-tune {
+        background-color: #F44336; /* Red */
+    }
+    #frequency-deviation {
+        font-size: 1.1em;
+        font-weight: bold;
+        margin-top: 10px;
+        min-height: 1.5em; /* Ensure space even when empty */
+        color: #333;
+    }
+    select {
+        padding: 8px;
+        font-size: 1em;
+        margin-bottom: 20px;
+        min-width: 250px; /* Ensure dropdown has a consistent width */
+    }
+    button {
+        padding: 10px 20px;
+        font-size: 1em;
+        cursor: pointer;
+        width: 200px; /* Fixed width for the button */
+        height: 40px; /* Fixed height for the button */
+    }
+</style>
+<script>
+
+
+// Define the set of test frequencies that we'll use to analyze microphone data.
+var C2 = 65.41; // C2 note, in Hz.
+var notes = [ "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" ];
+var test_frequencies = [];
+for (var i = 0; i < 30; i++)
+{
+    var note_frequency = C2 * Math.pow(2, i / 12);
+    var note_name = notes[i % 12];
+    var note = { "frequency": note_frequency, "name": note_name };
+    var just_above = { "frequency": note_frequency * Math.pow(2, 1 / 48), "name": note_name + " (a bit sharp)" };
+    var just_below = { "frequency": note_frequency * Math.pow(2, -1 / 48), "name": note_name + " (a bit flat)" };
+    test_frequencies = test_frequencies.concat([ just_below, note, just_above ]);
+}
+
+// Standard guitar string frequencies (E Standard Tuning)
+var guitar_string_frequencies = {
+    "E2": 82.41,
+    "A2": 110.00,
+    "D3": 146.83,
+    "G3": 196.00,
+    "B3": 246.94,
+    "E4": 329.63
+};
+
+var selected_string_frequency = 0; // Will be set by the dropdown
+
+window.addEventListener("load", initialize);
+
+var correlation_worker = new Worker("correlation_worker.js");
+correlation_worker.addEventListener("message", interpret_correlation_result);
+
+function initialize()
+{
+    var get_user_media = navigator.getUserMedia;
+    get_user_media = get_user_media || navigator.webkitGetUserMedia;
+    get_user_media = get_user_media || navigator.mozGetUserMedia;
+    get_user_media.call(navigator, { "audio": true }, use_stream, function() {});
+
+    document.getElementById("play-note").addEventListener("click", toggle_playing_note);
+
+    // Set initial selected string frequency to the first string (E2)
+    var stringSelector = document.getElementById("string-selector");
+    selected_string_frequency = guitar_string_frequencies[stringSelector.value];
+
+    // Add event listener for string selection
+    stringSelector.addEventListener("change", function() {
+        selected_string_frequency = guitar_string_frequencies[this.value];
+        updateTuningStatus("---", ""); // Reset status when string changes
+        updateFrequencyDeviation(""); // Reset deviation when string changes
+        // Clear note name and frequency display when string changes
+        document.getElementById("note-name").textContent = "";
+        document.getElementById("frequency").textContent = "";
+    });
+}
+
+function use_stream(stream)
+{
+    var audio_context = new AudioContext();
+    var microphone = audio_context.createMediaStreamSource(stream);
+    window.source = microphone; // Workaround for https://bugzilla.mozilla.org/show_bug.cgi/id=934512
+    var script_processor = audio_context.createScriptProcessor(1024, 1, 1);
+
+    script_processor.connect(audio_context.destination);
+    microphone.connect(script_processor);
+
+    var buffer = [];
+    var sample_length_milliseconds = 100;
+    var recording = true;
+
+    // Need to leak this function into the global namespace so it doesn't get
+    // prematurely garbage-collected.
+    // http://lists.w3.org/Archives/Public/public-audio/2013JanMar/0304.html
+    window.capture_audio = function(event)
+    {
+        if (!recording)
+            return;
+
+        buffer = buffer.concat(Array.prototype.slice.call(event.inputBuffer.getChannelData(0)));
+
+        // Stop recording after sample_length_milliseconds.
+        if (buffer.length > sample_length_milliseconds * audio_context.sampleRate / 1000)
+        {
+            recording = false;
+
+            correlation_worker.postMessage
+            (
+                {
+                    "timeseries": buffer,
+                    "test_frequencies": test_frequencies,
+                    "sample_rate": audio_context.sampleRate
+                }
+            );
+
+            buffer = [];
+            setTimeout(function() { recording = true; }, 250);
+        }
+    };
+
+    script_processor.onaudioprocess = window.capture_audio;
+}
+
+function interpret_correlation_result(event)
+{
+    var timeseries = event.data.timeseries;
+    var frequency_amplitudes = event.data.frequency_amplitudes;
+
+    // Compute the (squared) magnitudes of the complex amplitudes for each
+    // test frequency.
+    var magnitudes = frequency_amplitudes.map(function(z) { return z[0] * z[0] + z[1] * z[1]; });
+
+    // Find the maximum in the list of magnitudes.
+    var maximum_index = -1;
+    var maximum_magnitude = 0;
+    for (var i = 0; i < magnitudes.length; i++)
+    {
+        if (magnitudes[i] <= maximum_magnitude)
+            continue;
+
+        maximum_index = i;
+        maximum_magnitude = magnitudes[i];
+    }
+
+    // Compute the average magnitude. We'll only pay attention to frequencies
+    // with magnitudes significantly above average.
+    var average = magnitudes.reduce(function(a, b) { return a + b; }, 0) / magnitudes.length;
+    var confidence = maximum_magnitude / average;
+    var confidence_threshold = 10; // empirical, arbitrary.
+    if (confidence > confidence_threshold)
+    {
+        var dominant_frequency = test_frequencies[maximum_index];
+        document.getElementById("note-name").textContent = dominant_frequency.name;
+        document.getElementById("frequency").textContent = dominant_frequency.frequency.toFixed(2); // Format to 2 decimal places
+
+        // Compare with selected string frequency
+        var detected_frequency = dominant_frequency.frequency;
+        var tolerance = 1.0; // Hz tolerance for being "in tune"
+
+        if (selected_string_frequency > 0) { // Only check if a string is selected
+            var deviation = detected_frequency - selected_string_frequency;
+
+            if (Math.abs(deviation) < tolerance) {
+                updateTuningStatus("Đúng", "in-tune");
+                updateFrequencyDeviation("Độ lệch: " + deviation.toFixed(2) + " Hz");
+            } else {
+                updateTuningStatus("Sai", "out-of-tune");
+                updateFrequencyDeviation("Độ lệch: " + deviation.toFixed(2) + " Hz" + " (" + (deviation < 0 ? "Tăng" : "Giảm") + ")");
+            }
+        } else {
+            updateTuningStatus("---", ""); // No string selected, reset status
+            updateFrequencyDeviation(""); // No string selected, reset deviation
+        }
+
+    } else {
+        // If confidence is low (no clear sound detected), clear display and reset status
+        document.getElementById("note-name").textContent = "None"; // Display None for note name
+        document.getElementById("frequency").textContent = "None"; // Display None for frequency
+        updateTuningStatus("---", "");
+        updateFrequencyDeviation("");
+    }
+}
+
+function updateTuningStatus(text, className) {
+    var statusDiv = document.getElementById("tuning-status");
+    statusDiv.textContent = text;
+    statusDiv.className = ""; // Clear existing classes
+    if (className) {
+        statusDiv.classList.add(className);
+    }
+}
+
+function updateFrequencyDeviation(text) {
+    document.getElementById("frequency-deviation").textContent = text;
+}
+
+
+// Unnecessary addition of button to play an E note.
+var note_context = new AudioContext();
+var note_node = note_context.createOscillator();
+var gain_node = note_context.createGain();
+note_node.frequency = C2 * Math.pow(2, 4 / 12); // E, ~82.41 Hz.
+gain_node.gain.value = 0;
+note_node.connect(gain_node);
+gain_node.connect(note_context.destination);
+note_node.start();
+
+var playing = false;
+function toggle_playing_note()
+{
+    playing = !playing;
+    if (playing)
+        gain_node.gain.value = 0.1;
+    else
+        gain_node.gain.value = 0;
+}
+</script>
+</head>
+
+<body>
+<p>Bạn đang chơi nốt...</p>
+<div id="note-info-container">
+    <h1 id="note-name"></h1>
+    <p id="frequency-display-container">
+        <span>Tần số (Hz):</span>
+        <span id="frequency"></span>
+    </p>
+</div>
+
+
+<h2>Chọn dây đàn để chỉnh:</h2>
+<select id="string-selector">
+    <option value="E2">E Trầm (E2 - 82.41 Hz)</option>
+    <option value="A2">A (A2 - 110.00 Hz)</option>
+    <option value="D3">D (D3 - 146.83 Hz)</option>
+    <option value="G3">G (G3 - 196.00 Hz)</option>
+    <option value="B3">B (B3 - 246.94 Hz)</option>
+    <option value="E4">E Cao (E4 - 329.63 Hz)</option>
+</select>
+
+<div id="tuning-status">---</div>
+<div id="frequency-deviation"></div>
+<button id="play-note">Bắt đầu/Dừng</button>
+
+</body>
+</html>
